@@ -91,9 +91,9 @@ instance Connection SQliteConnection where
   prepare conn query = withConnectionUnlocked conn $ \con -> do
     res <- SD.prepare con $ SD.Utf8 $ toByteString $ fromLazyText $ unQuery query
     case res of
-      Left err -> throwErrMsg con err
+      Left err -> throwErrMsg con $ show err
       Right x -> case x of
-        Nothing -> throwIO $ SqlError "" "expression contains no Sql statements"
+        Nothing -> throwErrMsg con ""
         Just st -> SQliteStatement
                    <$> (newMVar $ SQNew st)
                    <*> conn
@@ -154,8 +154,78 @@ instance Statement SQliteStatement where
                     $ \con -> throwErrMsg con err
         Right ()  -> return SQFinished
 
-  -- reset stmt = modifyMVar_ (ssState stmt) $ \st -> case st of
+  reset stmt = modifyMVar_ (ssState stmt) $ \st -> case st of
+    SQFinished -> withConnectionUnlocked (ssConnection stmt) $ \con -> do
+      res <- SD.prepare con
+             $ encodeLUTF8
+             $ unQuery $ ssQuery stmt
+      case res of
+        Left err -> throwErrMsg con $ show err
+        Right mst -> case mst of
+          Nothing -> throwErrMsg con ""
+          Just stmt -> return $ SQNew stmt
+    x -> do
+      let rst = sqStatement x
+      res <- SD.reset rst
+      case res of
+        Left err -> withConnectionUnlocked (ssConnection stmt)
+                    $ \con -> throwErrMsg con err
+        Right () -> do
+          SD.clearBindings rst
+          return $ SQNew rst
 
+  fetchRow stmt = modifyMVar (ssState stmt) $ \st -> case st of
+    SQNew _ -> throwIO $ SqlDriverError
+               $ sqliteMsg "Statement is not executed to fetch rows from"
+    SQBinded x -> fetch' x
+    r@(SQEmpty {}) -> return (r, Nothing)
+    SQFinished -> throwIO $ SqlDriverError
+                  $ sqliteMsg "Statement is already finished to fetch rows from"
+      where
+        fetch' ss = do
+          cc <- SD.columnCount ss
+          res <- forM [1..cc] $ \col -> do
+            ct <- SD.columnType ss col
+            case ct of
+              SD.IntegerColumn -> SqlInteger . toInteger
+                                  <$> SD.columnInt64 ss col
+              SD.FloatColumn -> SqlDouble <$> SD.columnDouble ss col
+              SD.TextColumn -> SqlText . decodeLUTF8
+                               <$> SD.columnText ss col
+              SD.BlobColumn -> SqlBlob <$> SD.columnBlob ss col
+              SD.NullColumn -> return SqlNull
+          st <- SD.step ss
+          case st of
+            Left err -> withConnectionUnlocked (ssConnection stmt)
+                        $ \con -> throwErrMsg con $ show err
+            Right sres -> case sres of
+              SD.Row -> return $ SQBinded ss
+              SD.Done -> return $ SQEmpty ss
+
+  getColumnNames stmt = do
+    st <- readMVar $ ssState stmt
+    case st of
+      SQNew {} -> throwIO $ SqlDriverError $ sqliteMsg "Statement is not executed to get column names"
+      SQFinished -> throwIO $ SqlDriverError $ sqliteMsg "Statement is already finished to get column names"
+      x -> do
+        let sqst = sqStatement x
+        cols <- SD.columnCount sqst
+        forM [1..cols] $ \col -> do
+          res <- SD.columnName sqst col
+          case res of
+            Nothing -> return ""
+            Just val -> return $ decodeLUTF8 val
+  
+  getColumnsCount stmt = do
+    st <- readMVar $ ssState stmt
+    case st of
+      SQNew {} -> throwIO $ SqlDriverError $ sqliteMsg "Statement is not executed to get columns count"
+      SQFinished -> throwIO $ SqlDriverError $ sqliteMsg "Statement is already finished to get columns count"
+      x -> do
+        (SD.ColumnIndex idx) <- SD.columnCount $ sqStatement x
+        return idx
+
+  originalQuery stmt = ssQuery stmt
 
 bindParam :: SD.Statement -> SD.ParamIndex -> SqlValue -> IO ()
 bindParam st idx val = do
@@ -192,10 +262,10 @@ bindParam st idx val = do
     bind SqlNull = SD.bindNull st idx
 
 
-throwErrMsg :: SD.Database -> SD.Error -> IO a
+throwErrMsg :: SD.Database -> String -> IO a
 throwErrMsg db err = do
   (SD.Utf8 errmsg) <- SD.errmsg db
-  throwIO $ SqlError (show err) $ T.unpack $ T.decodeUtf8 errmsg
+  throwIO $ SqlError err $ T.unpack $ T.decodeUtf8 errmsg
 
 sqliteMsg :: String -> String
 sqliteMsg = ("hdbi-sqlite: " ++)
