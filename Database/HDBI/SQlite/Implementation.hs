@@ -11,13 +11,18 @@ import Blaze.ByteString.Builder.Char.Utf8 (fromText, fromLazyText, fromString)
 import Control.Applicative
 import Control.Concurrent.MVar
 import Control.Exception
+import Control.Monad (forM, forM_)
+import Data.Int
 import Data.Typeable
 import Database.HDBI.Formaters
 import Database.HDBI.SqlValue
 import Database.HDBI.Types
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import qualified Data.Text.Lazy as TL
+import qualified Data.Text.Lazy.Encoding as TL
 import qualified Database.SQLite3.Direct as SD
 
 encodeUTF8 :: T.Text -> SD.Utf8
@@ -31,6 +36,9 @@ encodeSUTF8 x = SD.Utf8 $ toByteString $ fromString x
 
 decodeUTF8 :: SD.Utf8 -> T.Text
 decodeUTF8 (SD.Utf8 x) = T.decodeUtf8 x
+
+decodeLUTF8 :: SD.Utf8 -> TL.Text
+decodeLUTF8 (SD.Utf8 x) = TL.decodeUtf8 $ BL.fromChunks [x]
 
 data SQliteConnection = SQliteConnection
                         { scDatabase :: MVar (Maybe SD.Database)
@@ -96,8 +104,8 @@ instance Connection SQliteConnection where
         Nothing -> throwErrMsg con ""
         Just st -> SQliteStatement
                    <$> (newMVar $ SQNew st)
-                   <*> conn
-                   <*> query
+                   <*> return conn
+                   <*> return query
 
   -- run: using default implementation
 
@@ -120,17 +128,19 @@ instance Statement SQliteStatement where
     r@(SQBinded {}) -> return r  --  FIXME: maybe throw error here?
     r@(SQEmpty {})  -> throwIO $ SqlDriverError "Statement is already executed"
     SQFinished -> throwIO $ SqlDriverError "Statement is already finished"
-      where
-        execute' st = do
-          forM_ (zip [1..] vals) $ curry $ bindParam st
-          res <- SD.step st      -- if this is INSERT or UPDATE query we need
-                                -- step to execute it.
-          case res of
-            Left err -> withConnectionUnlocked (ssConnection stmt)
-                        $ \con -> throwErrMsg con err
-            Right eres  -> case eres of
-              SD.Row -> return $ SQBinded st
-              SD.Done -> return $ SQEmpty st
+
+    where
+      execute' st = do
+        withConnectionUnlocked (ssConnection stmt)
+          $ \con -> forM_ (zip [1..] vals) $ uncurry $ bindParam con st
+        res <- SD.step st      -- if this is INSERT or UPDATE query we need
+                              -- step to execute it.
+        case res of
+          Left err -> withConnectionUnlocked (ssConnection stmt)
+                      $ \con -> throwErrMsg con $ show err
+          Right eres  -> case eres of
+            SD.Row -> return $ SQBinded st
+            SD.Done -> return $ SQEmpty st
 
   -- executeRaw: use default
   -- executeMany: use default implementation
@@ -151,7 +161,7 @@ instance Statement SQliteStatement where
       res <- SD.finalize $ sqStatement x
       case res of
         Left err -> withConnectionUnlocked (ssConnection stmt)
-                    $ \con -> throwErrMsg con err
+                    $ \con -> throwErrMsg con $ show err
         Right ()  -> return SQFinished
 
   reset stmt = modifyMVar_ (ssState stmt) $ \st -> case st of
@@ -169,7 +179,7 @@ instance Statement SQliteStatement where
       res <- SD.reset rst
       case res of
         Left err -> withConnectionUnlocked (ssConnection stmt)
-                    $ \con -> throwErrMsg con err
+                    $ \con -> throwErrMsg con $ show err
         Right () -> do
           SD.clearBindings rst
           return $ SQNew rst
@@ -181,26 +191,27 @@ instance Statement SQliteStatement where
     r@(SQEmpty {}) -> return (r, Nothing)
     SQFinished -> throwIO $ SqlDriverError
                   $ sqliteMsg "Statement is already finished to fetch rows from"
-      where
-        fetch' ss = do
-          cc <- SD.columnCount ss
-          res <- forM [1..cc] $ \col -> do
-            ct <- SD.columnType ss col
-            case ct of
-              SD.IntegerColumn -> SqlInteger . toInteger
-                                  <$> SD.columnInt64 ss col
-              SD.FloatColumn -> SqlDouble <$> SD.columnDouble ss col
-              SD.TextColumn -> SqlText . decodeLUTF8
-                               <$> SD.columnText ss col
-              SD.BlobColumn -> SqlBlob <$> SD.columnBlob ss col
-              SD.NullColumn -> return SqlNull
-          st <- SD.step ss
-          case st of
-            Left err -> withConnectionUnlocked (ssConnection stmt)
-                        $ \con -> throwErrMsg con $ show err
-            Right sres -> case sres of
-              SD.Row -> return $ SQBinded ss
-              SD.Done -> return $ SQEmpty ss
+    where
+      fetch' :: SD.Statement -> IO (SQState, Maybe [SqlValue])
+      fetch' ss = do
+        cc <- SD.columnCount ss
+        res <- forM [1..cc] $ \col -> do
+          ct <- SD.columnType ss col
+          case ct of
+            SD.IntegerColumn -> SqlInteger . toInteger
+                                <$> SD.columnInt64 ss col
+            SD.FloatColumn -> SqlDouble <$> SD.columnDouble ss col
+            SD.TextColumn -> SqlText . decodeLUTF8
+                             <$> SD.columnText ss col
+            SD.BlobColumn -> SqlBlob <$> SD.columnBlob ss col
+            SD.NullColumn -> return SqlNull
+        st <- SD.step ss
+        case st of
+          Left err -> withConnectionUnlocked (ssConnection stmt)
+                      $ \con -> throwErrMsg con $ show err
+          Right sres -> case sres of
+            SD.Row -> return (SQBinded ss, Just res)
+            SD.Done -> return (SQEmpty ss, Just res)
 
   getColumnNames stmt = do
     st <- readMVar $ ssState stmt
@@ -215,7 +226,7 @@ instance Statement SQliteStatement where
           case res of
             Nothing -> return ""
             Just val -> return $ decodeLUTF8 val
-  
+
   getColumnsCount stmt = do
     st <- readMVar $ ssState stmt
     case st of
@@ -227,18 +238,21 @@ instance Statement SQliteStatement where
 
   originalQuery stmt = ssQuery stmt
 
-bindParam :: SD.Statement -> SD.ParamIndex -> SqlValue -> IO ()
-bindParam st idx val = do
-  res <- bind bal
+bindParam :: SD.Database -> SD.Statement -> SD.ParamIndex -> SqlValue -> IO ()
+bindParam con st idx val = do
+  res <- bind val
   case res of
-    Left err -> withConnectionUnlocked (ssConnection st)
-                $ \con -> throwErrMsg con err
-    Right () -> return ()
+    Left err -> throwErrMsg con $ show err
+    Right ()  -> return ()
   where
     binds x = SD.bindText st idx $ encodeSUTF8 x
+
+    bindShow :: (Show a) => a -> IO (Either SD.Error ())
     bindShow x =  binds $ show x
+
     bindi i = SD.bindInt64 st idx i
 
+    downInt64 :: Integer -> Maybe Int64
     downInt64 i = if i > imax || i < imin
                   then Nothing
                   else Just $ fromInteger i
@@ -251,8 +265,8 @@ bindParam st idx val = do
       Nothing  -> bindShow i
       Just i64 -> bindi i64
     bind (SqlDouble d) = SD.bindDouble st idx d
-    bind (SqlText t) = bindText st idx $ encodeLUTF8 t
-    bind (SqlBlob b) = bindBlob st idx b
+    bind (SqlText t) = SD.bindText st idx $ encodeLUTF8 t
+    bind (SqlBlob b) = SD.bindBlob st idx b
     bind (SqlBitField bf) = bindShow bf
     bind (SqlUUID u) = bindShow u
     bind (SqlUTCTime ut) = binds $ formatIsoUTCTime ut
@@ -277,4 +291,3 @@ withConnectionUnlocked conn fun = do
     Nothing -> throwIO $ SqlDriverError
                $ sqliteMsg $ "connection is closed"
     Just x  -> fun x
-

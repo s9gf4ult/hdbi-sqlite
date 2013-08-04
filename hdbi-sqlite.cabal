@@ -34,6 +34,10 @@ build-type:          Simple
 -- Constraint on the version of Cabal needed to build this package.
 cabal-version:       >=1.8
 
+source-repository head
+  type:     git
+  location: https://github.com/s9gf4ult/hdbi-sqlite.git
+
 
 library
   -- Modules exported by the library.
@@ -49,3 +53,4 @@ library
                      , direct-sqlite
                      , text
                      , blaze-builder
+                     , bytestring
