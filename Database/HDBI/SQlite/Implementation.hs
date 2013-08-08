@@ -125,8 +125,8 @@ instance Connection SQliteConnection where
 instance Statement SQliteStatement where
   execute stmt vals = modifyMVar_ (ssState stmt) $ \state -> case state of
     SQNew st -> execute' st
-    r@(SQBinded {}) -> return r  --  FIXME: maybe throw error here?
-    r@(SQEmpty {})  -> throwIO $ SqlDriverError "Statement is already executed"
+    r@(SQBinded {}) -> throwIO $ SqlDriverError "Statement is already execute (Binded)"
+    r@(SQEmpty {})  -> throwIO $ SqlDriverError "Statement is already executed (Empty)"
     SQFinished -> throwIO $ SqlDriverError "Statement is already finished"
 
     where
@@ -195,7 +195,7 @@ instance Statement SQliteStatement where
       fetch' :: SD.Statement -> IO (SQState, Maybe [SqlValue])
       fetch' ss = do
         cc <- SD.columnCount ss
-        res <- forM [1..cc] $ \col -> do
+        res <- forM [0..cc-1] $ \col -> do
           ct <- SD.columnType ss col
           case ct of
             SD.IntegerColumn -> SqlInteger . toInteger
@@ -221,7 +221,7 @@ instance Statement SQliteStatement where
       x -> do
         let sqst = sqStatement x
         cols <- SD.columnCount sqst
-        forM [1..cols] $ \col -> do
+        forM [0..cols-1] $ \col -> do
           res <- SD.columnName sqst col
           case res of
             Nothing -> return ""
@@ -267,6 +267,7 @@ bindParam con st idx val = do
     bind (SqlDouble d) = SD.bindDouble st idx d
     bind (SqlText t) = SD.bindText st idx $ encodeLUTF8 t
     bind (SqlBlob b) = SD.bindBlob st idx b
+    bind (SqlBool b) = bindi $ if b then 1 else 0
     bind (SqlBitField bf) = bindShow bf
     bind (SqlUUID u) = bindShow u
     bind (SqlUTCTime ut) = binds $ formatIsoUTCTime ut

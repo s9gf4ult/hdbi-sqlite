@@ -49,8 +49,24 @@ library
   
   -- Other library packages from which modules are imported.
   build-depends:       base ==4.5.*
-                     , hdbi >= 1.0.0
+                     , hdbi >= 1.1.0
                      , direct-sqlite
                      , text
                      , blaze-builder
                      , bytestring
+
+
+test-suite runtests
+   type: exitcode-stdio-1.0
+   main-is: testsrc/runtests.hs
+   other-modules: Database.HDBI.SQlite.Implementation
+
+   ghc-options:   -Wall -fno-warn-orphans -main-is Runtests
+   build-depends:  base >= 3 && < 5
+                 , blaze-builder
+                 , bytestring
+                 , direct-sqlite
+                 , hdbi >= 1.1.0
+                 , hdbi-tests >= 1.1.0
+                 , test-framework
+                 , text
