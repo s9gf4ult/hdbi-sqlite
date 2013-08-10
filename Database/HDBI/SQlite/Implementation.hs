@@ -14,10 +14,10 @@ import Control.Exception
 import Control.Monad (forM, forM_)
 import Data.Int
 import Data.Typeable
+import Database.HDBI.DriverUtils
 import Database.HDBI.Formaters
 import Database.HDBI.SqlValue
 import Database.HDBI.Types
-import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -43,6 +43,7 @@ decodeLUTF8 (SD.Utf8 x) = TL.decodeUtf8 $ BL.fromChunks [x]
 data SQliteConnection = SQliteConnection
                         { scDatabase :: MVar (Maybe SD.Database)
                         , scConnString :: T.Text
+                        , scStatements :: ChildList SQliteStatement
                         }
                         deriving (Typeable)
 
@@ -54,8 +55,12 @@ data SQliteStatement = SQliteStatement
                        deriving (Typeable)
 
 data SQState = SQNew { sqStatement :: SD.Statement }
-             | SQBinded { sqStatement :: SD.Statement }
-             | SQEmpty  { sqStatement :: SD.Statement }
+             | SQExecuted { sqStatement :: SD.Statement
+                          , sqResult :: SD.StepResult
+                          }
+             | SQFetching { sqStatement :: SD.Statement
+                          , sqResult :: SD.StepResult
+                          }
              | SQFinished
 
 connectSqlite3 :: T.Text -> IO SQliteConnection
@@ -67,13 +72,15 @@ connectSqlite3 connstr = do
     Right r -> SQliteConnection
                <$> newMVar (Just r)
                <*> return connstr
+               <*> newChildList
 
 instance Connection SQliteConnection where
   type ConnStatement SQliteConnection = SQliteStatement
 
-  disconnect conn = modifyMVar_ (scDatabase conn) $ \con -> case con of
+  disconnect conn = modifyMVar_ (scDatabase conn) $ \c -> case c of
     Nothing -> return Nothing
     Just (con) -> do
+      closeAllChildren (scStatements conn)
       res <- SD.close con
       case res of
         Left err  -> throwIO $ SqlError (show err) "Could not close the database"
@@ -102,10 +109,13 @@ instance Connection SQliteConnection where
       Left err -> throwErrMsg con $ show err
       Right x -> case x of
         Nothing -> throwErrMsg con ""
-        Just st -> SQliteStatement
-                   <$> (newMVar $ SQNew st)
-                   <*> return conn
-                   <*> return query
+        Just st -> do
+          ret <- SQliteStatement
+                 <$> (newMVar $ SQNew st)
+                 <*> return conn
+                 <*> return query
+          addChild (scStatements conn) ret
+          return ret
 
   -- run: using default implementation
 
@@ -125,9 +135,9 @@ instance Connection SQliteConnection where
 instance Statement SQliteStatement where
   execute stmt vals = modifyMVar_ (ssState stmt) $ \state -> case state of
     SQNew st -> execute' st
-    r@(SQBinded {}) -> throwIO $ SqlDriverError "Statement is already execute (Binded)"
-    r@(SQEmpty {})  -> throwIO $ SqlDriverError "Statement is already executed (Empty)"
-    SQFinished -> throwIO $ SqlDriverError "Statement is already finished"
+    SQExecuted {} -> throwIO $ SqlDriverError $ sqliteMsg "Statement is already executed"
+    SQFetching {} -> throwIO $ SqlDriverError $ sqliteMsg "Statement is already executed (fetching)"
+    SQFinished -> throwIO $ SqlDriverError $ sqliteMsg "Statement is already finished"
 
     where
       execute' st = do
@@ -138,19 +148,18 @@ instance Statement SQliteStatement where
         case res of
           Left err -> withConnectionUnlocked (ssConnection stmt)
                       $ \con -> throwErrMsg con $ show err
-          Right eres  -> case eres of
-            SD.Row -> return $ SQBinded st
-            SD.Done -> return $ SQEmpty st
+          Right eres  -> return $ SQExecuted st eres
 
   -- executeRaw: use default
   -- executeMany: use default implementation
   statementStatus stmt = do
     res <- readMVar $ ssState stmt
     return $ case res of
-      SQNew {} -> StatementNew
-      SQBinded {} -> StatementExecuted
-      SQEmpty {} -> StatementFetched
-      SQFinished -> StatementFinished
+      SQNew {}             -> StatementNew
+      SQExecuted {}        -> StatementExecuted
+      SQFetching _ SD.Row  -> StatementExecuted
+      SQFetching _ SD.Done -> StatementFetched
+      SQFinished           -> StatementFinished
 
   -- affectedRows: can not be implemented safely because database has no this
   -- feature
@@ -173,7 +182,7 @@ instance Statement SQliteStatement where
         Left err -> throwErrMsg con $ show err
         Right mst -> case mst of
           Nothing -> throwErrMsg con ""
-          Just stmt -> return $ SQNew stmt
+          Just s -> return $ SQNew s
     x -> do
       let rst = sqStatement x
       res <- SD.reset rst
@@ -187,8 +196,10 @@ instance Statement SQliteStatement where
   fetchRow stmt = modifyMVar (ssState stmt) $ \st -> case st of
     SQNew _ -> throwIO $ SqlDriverError
                $ sqliteMsg "Statement is not executed to fetch rows from"
-    SQBinded x -> fetch' x
-    r@(SQEmpty {}) -> return (r, Nothing)
+    SQExecuted x SD.Row      -> fetch' x
+    SQExecuted x SD.Done     -> return (SQFetching x SD.Done, Nothing)
+    SQFetching x SD.Row      -> fetch' x
+    r@(SQFetching _ SD.Done) -> return (r, Nothing)
     SQFinished -> throwIO $ SqlDriverError
                   $ sqliteMsg "Statement is already finished to fetch rows from"
     where
@@ -209,9 +220,7 @@ instance Statement SQliteStatement where
         case st of
           Left err -> withConnectionUnlocked (ssConnection stmt)
                       $ \con -> throwErrMsg con $ show err
-          Right sres -> case sres of
-            SD.Row -> return (SQBinded ss, Just res)
-            SD.Done -> return (SQEmpty ss, Just res)
+          Right sres -> return (SQFetching ss sres, Just res)
 
   getColumnNames stmt = do
     st <- readMVar $ ssState stmt

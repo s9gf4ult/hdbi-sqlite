@@ -12,8 +12,8 @@ import Database.HDBI
 import Database.HDBI.SQlite.Implementation
 import Database.HDBI.Tests (allTests, TestFieldTypes(..))
 import Test.Framework
-import qualified Data.Text.Lazy as TL
-  
+
+fields :: TestFieldTypes
 fields = TestFieldTypes
          { tfDecimal = ""
          , tfInteger = ""
