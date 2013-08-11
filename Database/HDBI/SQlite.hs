@@ -1,6 +1,11 @@
 module Database.HDBI.SQlite
        (
-         module Database.HDBI.SQlite.Implementation
+         -- * Types
+         SQliteConnection(..)
+       , SQliteStatement(..)
+       , SQState(..)
+         -- * Functions
+       , connectSqlite3
        ) where
 
 import Database.HDBI.SQlite.Implementation

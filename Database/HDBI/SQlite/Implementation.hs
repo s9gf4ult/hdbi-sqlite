@@ -4,7 +4,26 @@
 , OverloadedStrings
   #-}
 
-module Database.HDBI.SQlite.Implementation where
+module Database.HDBI.SQlite.Implementation
+       (
+         -- * types
+         SQliteConnection (..)
+       , SQliteStatement (..)
+       , SQState (..)
+         -- * connecting
+       , connectSqlite3
+         -- * auxiliary functions
+       , encodeUTF8
+       , encodeLUTF8
+       , encodeSUTF8
+       , decodeUTF8
+       , decodeLUTF8
+       , fetchValue
+       , bindParam
+       , throwErrMsg
+       , sqliteMsg
+       , withConnectionUnlocked
+       ) where
 
 import Blaze.ByteString.Builder (toByteString)
 import Blaze.ByteString.Builder.Char.Utf8 (fromText, fromLazyText, fromString)
@@ -40,13 +59,15 @@ decodeUTF8 (SD.Utf8 x) = T.decodeUtf8 x
 decodeLUTF8 :: SD.Utf8 -> TL.Text
 decodeLUTF8 (SD.Utf8 x) = TL.decodeUtf8 $ BL.fromChunks [x]
 
+-- | Connection to the database
 data SQliteConnection = SQliteConnection
                         { scDatabase :: MVar (Maybe SD.Database)
                         , scConnString :: T.Text
-                        , scStatements :: ChildList SQliteStatement
+                        , scStatements :: ChildList SQliteStatement -- ^ List of statements to finish before disconnect
                         }
                         deriving (Typeable)
 
+-- | Prepared statement
 data SQliteStatement = SQliteStatement
                        { ssState :: MVar SQState
                        , ssConnection :: SQliteConnection
@@ -54,6 +75,9 @@ data SQliteStatement = SQliteStatement
                        }
                        deriving (Typeable)
 
+-- | Internal state of the statement. There is two similar constructors
+-- 'SQFetching' and 'SQExecuted' to simulate proper behaviour according to
+-- tests.
 data SQState = SQNew { sqStatement :: SD.Statement }
              | SQExecuted { sqStatement :: SD.Statement
                           , sqResult :: SD.StepResult
@@ -63,7 +87,9 @@ data SQState = SQNew { sqStatement :: SD.Statement }
                           }
              | SQFinished
 
-connectSqlite3 :: T.Text -> IO SQliteConnection
+-- | Connect to SQlite3 database
+connectSqlite3 :: T.Text -- ^ Connection string
+                  -> IO SQliteConnection
 connectSqlite3 connstr = do
   res <- SD.open $ SD.Utf8 $ toByteString $ fromText connstr
   case res of
@@ -83,7 +109,7 @@ instance Connection SQliteConnection where
       closeAllChildren (scStatements conn)
       res <- SD.close con
       case res of
-        Left err  -> throwIO $ SqlError (show err) "Could not close the database"
+        Left err  -> throwErrMsg con $ show err
         Right () -> return Nothing
 
   begin conn = runRaw conn "begin"
@@ -143,12 +169,10 @@ instance Statement SQliteStatement where
       execute' st = do
         withConnectionUnlocked (ssConnection stmt)
           $ \con -> forM_ (zip [1..] vals) $ uncurry $ bindParam con st
-        res <- SD.step st      -- if this is INSERT or UPDATE query we need
-                              -- step to execute it.
-        case res of
-          Left err -> withConnectionUnlocked (ssConnection stmt)
-                      $ \con -> throwErrMsg con $ show err
-          Right eres  -> return $ SQExecuted st eres
+        res <- getRight (ssConnection stmt)
+               $ SD.step st      -- if this is INSERT or UPDATE query we need
+                                 -- step to execute it.
+        return $ SQExecuted st res
 
   -- executeRaw: use default
   -- executeMany: use default implementation
@@ -161,17 +185,12 @@ instance Statement SQliteStatement where
       SQFetching _ SD.Done -> StatementFetched
       SQFinished           -> StatementFinished
 
-  -- affectedRows: can not be implemented safely because database has no this
-  -- feature
-
   finish stmt = modifyMVar_ (ssState stmt) $ \st -> case st of
     SQFinished -> return SQFinished
     x -> do
-      res <- SD.finalize $ sqStatement x
-      case res of
-        Left err -> withConnectionUnlocked (ssConnection stmt)
-                    $ \con -> throwErrMsg con $ show err
-        Right ()  -> return SQFinished
+      getRight (ssConnection stmt)
+        $ SD.finalize $ sqStatement x
+      return SQFinished
 
   reset stmt = modifyMVar_ (ssState stmt) $ \st -> case st of
     SQFinished -> withConnectionUnlocked (ssConnection stmt) $ \con -> do
@@ -185,13 +204,10 @@ instance Statement SQliteStatement where
           Just s -> return $ SQNew s
     x -> do
       let rst = sqStatement x
-      res <- SD.reset rst
-      case res of
-        Left err -> withConnectionUnlocked (ssConnection stmt)
-                    $ \con -> throwErrMsg con $ show err
-        Right () -> do
-          SD.clearBindings rst
-          return $ SQNew rst
+      getRight (ssConnection stmt)
+        $ SD.reset rst
+      SD.clearBindings rst
+      return $ SQNew rst
 
   fetchRow stmt = modifyMVar (ssState stmt) $ \st -> case st of
     SQNew _ -> throwIO $ SqlDriverError
@@ -206,21 +222,9 @@ instance Statement SQliteStatement where
       fetch' :: SD.Statement -> IO (SQState, Maybe [SqlValue])
       fetch' ss = do
         cc <- SD.columnCount ss
-        res <- forM [0..cc-1] $ \col -> do
-          ct <- SD.columnType ss col
-          case ct of
-            SD.IntegerColumn -> SqlInteger . toInteger
-                                <$> SD.columnInt64 ss col
-            SD.FloatColumn -> SqlDouble <$> SD.columnDouble ss col
-            SD.TextColumn -> SqlText . decodeLUTF8
-                             <$> SD.columnText ss col
-            SD.BlobColumn -> SqlBlob <$> SD.columnBlob ss col
-            SD.NullColumn -> return SqlNull
-        st <- SD.step ss
-        case st of
-          Left err -> withConnectionUnlocked (ssConnection stmt)
-                      $ \con -> throwErrMsg con $ show err
-          Right sres -> return (SQFetching ss sres, Just res)
+        res <- forM [0..cc-1] $ \col -> fetchValue ss col
+        sres <- getRight (ssConnection stmt) $ SD.step ss
+        return (SQFetching ss sres, Just res)
 
   getColumnNames stmt = do
     st <- readMVar $ ssState stmt
@@ -247,6 +251,35 @@ instance Statement SQliteStatement where
 
   originalQuery stmt = ssQuery stmt
 
+
+-- | fetch value from particular column of current row in particular statement
+fetchValue :: SD.Statement
+              -> SD.ColumnIndex
+              -> IO SqlValue
+fetchValue ss col = do
+  ct <- SD.columnType ss col
+  case ct of
+    SD.IntegerColumn -> SqlInteger . toInteger
+                        <$> SD.columnInt64 ss col
+    SD.FloatColumn -> SqlDouble <$> SD.columnDouble ss col
+    SD.TextColumn -> SqlText . decodeLUTF8
+                     <$> SD.columnText ss col
+    SD.BlobColumn -> SqlBlob <$> SD.columnBlob ss col
+    SD.NullColumn -> return SqlNull
+
+-- | If action return (Left error) then get description from the database and
+-- throw error. Else return the value.
+getRight :: SQliteConnection
+            -> IO (Either SD.Error a) -- ^ action to execute
+            -> IO a
+getRight con act = do
+  res <- act
+  case res of
+    Left err -> withConnectionUnlocked con
+                $ \c -> throwErrMsg c $ show err
+    Right a -> return a
+
+-- | bind SqlValue to the particular parameter of query of particular statement.
 bindParam :: SD.Database -> SD.Statement -> SD.ParamIndex -> SqlValue -> IO ()
 bindParam con st idx val = do
   res <- bind val
@@ -285,15 +318,18 @@ bindParam con st idx val = do
     bind (SqlLocalTime lt) = binds $ formatIsoLocalTime lt
     bind SqlNull = SD.bindNull st idx
 
-
+-- | Get error description from the database and throw exception with it.
 throwErrMsg :: SD.Database -> String -> IO a
 throwErrMsg db err = do
   (SD.Utf8 errmsg) <- SD.errmsg db
   throwIO $ SqlError err $ T.unpack $ T.decodeUtf8 errmsg
 
+-- | prepend package name to the string for error reporting
 sqliteMsg :: String -> String
 sqliteMsg = ("hdbi-sqlite: " ++)
 
+-- | Get internal 'SD.Database' from the 'SQliteConnection' and execute and
+-- action with it. Or throw an error if connection is already closed.
 withConnectionUnlocked :: SQliteConnection -> (SD.Database -> IO a) -> IO a
 withConnectionUnlocked conn fun = do
   val <- readMVar $ scDatabase $ conn
