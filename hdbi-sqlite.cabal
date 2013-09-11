@@ -1,5 +1,5 @@
 name:                hdbi-sqlite
-version:             1.1.0
+version:             1.1.1
 
 synopsis:            SQlite driver for HDBI
 homepage:            https://github.com/s9gf4ult/hdbi-sqlite
