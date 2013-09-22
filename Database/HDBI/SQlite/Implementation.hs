@@ -209,7 +209,7 @@ instance Statement SQliteStatement where
       SD.clearBindings rst
       return $ SQNew rst
 
-  fetchRow stmt = modifyMVar (ssState stmt) $ \st -> case st of
+  fetch stmt = modifyMVar (ssState stmt) $ \st -> case st of
     SQNew _ -> throwIO $ SqlDriverError
                $ sqliteMsg "Statement is not executed to fetch rows from"
     SQExecuted x SD.Row      -> fetch' x
