@@ -112,11 +112,11 @@ instance Connection SQliteConnection where
         Left err  -> throwErrMsg con $ show err
         Right () -> return Nothing
 
-  begin conn = runRaw conn "begin"
+  begin conn = run conn "begin" ()
 
-  commit conn = runRaw conn "commit"
+  commit conn = run conn "commit" ()
 
-  rollback conn = runRaw conn "rollback"
+  rollback conn = run conn "rollback" ()
 
   inTransaction conn = withConnectionUnlocked conn $ \con -> do
     ac <- SD.getAutoCommit con
@@ -168,7 +168,7 @@ instance Statement SQliteStatement where
     where
       execute' st = do
         withConnectionUnlocked (ssConnection stmt)
-          $ \con -> forM_ (zip [1..] vals) $ uncurry $ bindParam con st
+          $ \con -> forM_ (zip [1..] $ toRow vals) $ uncurry $ bindParam con st
         res <- getRight (ssConnection stmt)
                $ SD.step st      -- if this is INSERT or UPDATE query we need
                                  -- step to execute it.
@@ -219,12 +219,11 @@ instance Statement SQliteStatement where
     SQFinished -> throwIO $ SqlDriverError
                   $ sqliteMsg "Statement is already finished to fetch rows from"
     where
-      fetch' :: SD.Statement -> IO (SQState, Maybe [SqlValue])
       fetch' ss = do
         cc <- SD.columnCount ss
         res <- forM [0..cc-1] $ \col -> fetchValue ss col
         sres <- getRight (ssConnection stmt) $ SD.step ss
-        return (SQFetching ss sres, Just res)
+        return (SQFetching ss sres, Just $ fromRow res)
 
   getColumnNames stmt = do
     st <- readMVar $ ssState stmt
